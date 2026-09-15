@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-r"""strip_claude_images.py - reclaim disk from Claude Code session logs by offloading the
-base64 images out of CLOSED conversations, safely.
+r"""offload_claude_images.py - move the images OUT of old Claude Code session logs into a real,
+browsable folder. Not a stripper - an offloader.
 
-STANDALONE + STDLIB ONLY. This is the self-contained distillation of a feature we run in
-production as a supervised daemon (see the repo root). It exists so you can read and run the
-whole idea in one file.
+STANDALONE + STDLIB ONLY. The whole idea in one dependency-free file (we run this in production as
+a supervised daemon; this is here so you can read and run it).
 
-THE PROBLEM (well documented against anthropics/claude-code):
-  Claude Code stores each conversation as an append-only .jsonl. Pasted/returned images are
-  inlined as base64 - ~1MB each - so a screenshot-heavy session balloons to tens or hundreds of
-  MB, which slows every tool that reads the log and, in the worst cases, hangs the client / OOMs
-  the host (issues #22365, #18905, #79196).
+TWO PROBLEMS, ONE MOVE:
+  1. BLOAT. Claude Code inlines images as base64 (~1MB each) into an append-only .jsonl, so a
+     screenshot-heavy session grows to tens/hundreds of MB - slow to read, and at the extreme it
+     hangs the client / OOMs the host (anthropics/claude-code #22365, #18905, #79196).
+  2. TRAPPED IMAGES. Every screenshot you ever pasted is base64 goo buried mid-line in a log. You
+     PAY disk to store it but you can't open, browse, or selectively delete it. Write-only storage.
 
-THE NON-OBVIOUS PART - why you can't just strip the images:
-  Claude's API prompt cache is an EXACT-PREFIX match. If you rewrite the transcript that is still
-  being sent to the model, the cached prefix no longer matches and the whole prompt is re-billed
-  as new. So naive stripping SAVES disk but COSTS money on the next turn.
+  Offloading fixes BOTH: each image is written out as a real .png/.jpg (named by content hash, so
+  duplicates collapse) and REPLACED in the log by a tiny reference. The log shrinks AND the images
+  become a folder of real files you can view, back up, or clean. It's a MOVE, not a delete -
+  nothing is lost, the reference keeps each image linked to its spot in the conversation.
 
-  The fix is to only ever touch conversations that are DONE:
+WHY YOU CAN'T DO IT TO A LIVE LOG (the constraint that shapes everything):
+  Claude's prompt cache is an EXACT-PREFIX match. Rewrite a transcript that's still being sent and
+  the cached prefix no longer matches, so the whole prompt is re-billed as new - you'd save disk
+  and pay it back in tokens. So we only ever touch conversations that are DONE:
     - never the newest N sessions (your live conversation(s)), and
     - never anything modified in the last few minutes (still being appended / still cached).
-  A closed conversation is never re-sent, so stripping its images is free.
-
-WHAT IT DOES (idempotent):
-  For each eligible closed .jsonl, every base64 image block is written out to <offload-dir> as a
-  real file (named by content hash, so duplicates collapse) and REPLACED in the log by a tiny
-  reference: {"type":"image_offloaded","path":..,"bytes":..,"media_type":..}. Re-running finds no
-  base64 left and does nothing. All non-image bytes are preserved exactly.
+  A closed conversation is never re-sent, so offloading its images is free. (Idempotent, too:
+  re-running finds no base64 and does nothing.)
 
 USAGE:
-    python strip_claude_images.py --offload-dir ./claude_images            # default projects dir
-    python strip_claude_images.py --projects-dir <dir> --offload-dir <dir> --dry-run
-    python strip_claude_images.py --offload-dir <dir> --keep-newest 2 --min-age-min 15
+    python offload_claude_images.py --offload-dir ./claude_images --dry-run   # report only
+    python offload_claude_images.py --offload-dir ./claude_images             # do it
+    #   --projects-dir <dir>   (default: ~/.claude/projects)
+    #   --keep-newest 2        never touch the N newest sessions
+    #   --min-age-min 15       never touch a log modified in the last N minutes
 
 Built by Trent Tompkins. MIT.
 """
@@ -62,12 +62,11 @@ def _looks_base64_image(node):
 
 
 def _offload_one(data_b64, media_type, offload_dir, dry_run):
-    """Write the image to offload_dir named by content hash; return (path, bytes)."""
+    """Write the image out to offload_dir named by content hash; return (path, bytes)."""
     raw = base64.b64decode(data_b64 + "=" * (-len(data_b64) % 4))
     h = hashlib.sha256(raw).hexdigest()[:16]
     ext = EXT_BY_MEDIA.get(media_type, "bin")
-    name = f"{h}.{ext}"
-    path = os.path.join(offload_dir, name)
+    path = os.path.join(offload_dir, f"{h}.{ext}")
     if not dry_run and not os.path.exists(path):
         os.makedirs(offload_dir, exist_ok=True)
         with open(path, "wb") as f:
@@ -85,7 +84,7 @@ def _walk_and_offload(node, offload_dir, dry_run, stats):
         stats["bytes"] += len(data)  # base64 length ~ what leaves the log
         return {"type": "image_offloaded", "path": path, "bytes": nbytes, "media_type": media_type}
     if isinstance(node, dict):
-        # also catch the second spot images hide: toolUseResult.file.base64
+        # also catches the second spot images hide: toolUseResult.file.base64
         return {k: _walk_and_offload(v, offload_dir, dry_run, stats) for k, v in node.items()}
     if isinstance(node, list):
         return [_walk_and_offload(v, offload_dir, dry_run, stats) for v in node]
@@ -118,10 +117,11 @@ def process_log(path, offload_dir, dry_run):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Offload base64 images from CLOSED Claude Code logs.")
+    ap = argparse.ArgumentParser(description="Offload base64 images out of CLOSED Claude Code logs "
+                                             "into a real folder.")
     ap.add_argument("--projects-dir", default=DEFAULT_PROJECTS,
                     help="Claude Code projects dir (default: ~/.claude/projects)")
-    ap.add_argument("--offload-dir", required=True, help="where extracted images are saved")
+    ap.add_argument("--offload-dir", required=True, help="where the extracted image files go")
     ap.add_argument("--keep-newest", type=int, default=2,
                     help="never touch the N newest sessions (your live convos)")
     ap.add_argument("--min-age-min", type=float, default=15.0,
@@ -149,11 +149,12 @@ def main():
             touched += 1
             total_imgs += imgs
             total_bytes += byts
-            print(f"  {os.path.basename(p):40s}  {imgs:3d} images  ~{byts/1e6:6.1f} MB")
+            print(f"  {os.path.basename(p):40s}  {imgs:3d} images -> files  ~{byts/1e6:6.1f} MB")
 
-    verb = "would reclaim" if args.dry_run else "reclaimed"
-    print(f"\n{touched} logs, {total_imgs} images {verb} ~{total_bytes/1e6:.1f} MB "
-          f"(newest {args.keep_newest} + anything <{args.min_age_min:g}min protected)")
+    verb = "would move" if args.dry_run else "moved"
+    print(f"\n{touched} logs, {total_imgs} images {verb} to {args.offload_dir}  "
+          f"(~{total_bytes/1e6:.1f} MB out of the logs; newest {args.keep_newest} + "
+          f"anything <{args.min_age_min:g}min protected)")
     return 0
 
 
