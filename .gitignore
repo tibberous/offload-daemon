@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+*.sqlite*
+*.lastgood.db
+config.ini
+.env
+secrets/
+.claude/
+CLAUDE.md
