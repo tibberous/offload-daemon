@@ -8,3 +8,4 @@ config.ini
 secrets/
 .claude/
 CLAUDE.md
+offloads/vps_images_offload.py
